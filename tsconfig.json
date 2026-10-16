@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "module": "commonjs",
+    "target": "es2020",
+    "types": [],
+    "sourceMap": true,
+    "declaration": true,
+    "strict": true,
+    "jsx": "react-jsx",
+    "isolatedModules": true,
+    "noUncheckedSideEffectImports": true,
+    "esModuleInterop": true,
+    "lib": ["es2020", "dom"],
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*"]
+}
