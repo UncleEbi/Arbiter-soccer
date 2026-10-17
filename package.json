@@ -1,0 +1,26 @@
+{
+  "name": "arbiter-soccer",
+  "version": "1.0.0",
+  "description": "Football prediction with value-bet identification using Poisson + Dixon-Coles and Kelly staking",
+  "main": "dist/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "tsc -p tsconfig.json && echo 'backend-built'",
+    "start": "node dist/index.js"
+  },
+  "keywords": ["football", "soccer", "prediction", "poisson", "dixon-coles", "kelly", "value-betting"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.20.0",
+    "cors": "^2.8.6",
+    "express": "^5.3.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.5",
+    "typescript": "^5.5.0"
+  }
+}
