@@ -2,6 +2,27 @@ import express, { Request, Response } from 'express';
 import axios from 'axios';
 import cors from 'cors';
 
+// EPUB Text Decoder - ensures binary EPUB data is parsed explicitly as UTF-8
+// EPUBs are zip archives; without explicit decoder, engines may default to latin-1
+function decodeEpubText(arrayBuffer: ArrayBuffer): string {
+  const decoder = new TextDecoder('utf-8');
+  return decoder.decode(arrayBuffer);
+}
+
+// Sanitize common mojibake on ingestion
+// Fixes garbled UTF-8 bytes that appear as mojibake when decoded as the wrong encoding
+function cleanMojibake(text: string): string {
+  return text
+    .replace(/â€™/g, '’')
+    .replace(/â€˜/g, '‘')
+    .replace(/â€¢/g, '•')
+    .replace(/â€¦/g, '…')
+    .replace(/â€¦/g, '…')
+    .replace(/â€¢/g, '•')
+    .replace(/Â /g, ' ')
+    .replace(/Â/g, '');
+}
+
 const app = express();
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
 const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY || 'demo';
