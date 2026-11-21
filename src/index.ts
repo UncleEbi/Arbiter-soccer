@@ -1,517 +1,605 @@
 import express, { Request, Response } from 'express';
 import axios from 'axios';
 import cors from 'cors';
+import path from 'path';
+import fs from 'fs';
+import {
+  SportType,
+  predictPoissonDC,
+  predictBasketballNBA,
+  predictHockeyNHL,
+  predictTennis,
+  TeamRatings,
+  LiveStats,
+  LineupModifier,
+  normalizeTeamName,
+} from './model';
+import {
+  identifyValueBets,
+  MarketOdds,
+  ValueBetAnalysis,
+  oddsToImpliedProb,
+  calculateEV,
+  calculateKellyFraction,
+} from './valueBetting';
+import { BankrollJournal, BetRecord } from './journal';
+import { runBacktest, BacktestOptions } from './backtest';
+import { dynamicRatingEngine, DynamicTeamRating } from './dynamicRatings';
+import { calibrationTracker, CalibrationMetrics } from './calibration';
+import {
+  generateDailyDigest,
+  exportMatchesToCSV,
+  exportMatchesToJSON,
+  dispatchWebhook,
+  DailyDigestReport,
+} from './exportAndDigest';
+import { LiveFeedManager, FeedStatus } from './liveIngestion';
 
 const app = express();
-const PORT = parseInt(process.env.PORT ?? '3000', 10);
+const PORT = parseInt(process.env.PORT ?? '5000', 10);
 const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY || 'demo';
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
+// In-memory bankroll journal instance
+const journal = new BankrollJournal(1000);
+
+export interface TeamLineupInfo {
+  formation: string;
+  status: 'Confirmed' | 'Predicted';
+  keyPlayers: string[];
+  absentees: string[];
+  tacticalStyle: string;
+}
+
+export interface MatchStatsInfo {
+  homeForm: Array<'W' | 'D' | 'L'>;
+  awayForm: Array<'W' | 'D' | 'L'>;
+  homeAvgScored: number;
+  homeAvgConceded: number;
+  awayAvgScored: number;
+  awayAvgConceded: number;
+  homeCleanSheetPct: number;
+  awayCleanSheetPct: number;
+  h2hSummary: string;
+}
+
 // In-memory cache for match data
-interface MatchData {
+export interface MatchData {
   fixtureId: number;
+  sport: SportType;
+  country: string;
   homeTeam: string;
   awayTeam: string;
+  kickoffDate: string; // ISO 8601 string
+  league: string;
+  venue: string;
+  round?: string;
   homeGoals?: number;
   awayGoals?: number;
   status: 'scheduled' | 'live' | 'finished';
-  liveStats?: {
-    possession: number;
-    shots: number;
-    shotsOnTarget: number;
-    corners: number;
-    fouls: number;
+  liveStats?: LiveStats;
+  lineupInfo?: {
+    home: TeamLineupInfo;
+    away: TeamLineupInfo;
   };
-  odds?: {
-    home: number; // decimal odds (e.g., 2.50)
-    draw: number; // decimal odds (e.g., 3.40)
-    away: number; // decimal odds (e.g., 2.80)
-    lastUpdated?: string;
-  };
+  stats?: MatchStatsInfo;
+  odds?: MarketOdds;
+  sportSpecificStats?: Record<string, any>;
 }
 
-// Simulated match data - in production, this would come from API-Football
+// Simulated match repository across sports and countries
 const matches: Map<string, MatchData> = new Map();
-// Pre-populate with some sample matches
+const feedManager = new LiveFeedManager(matches);
+
+// 1. England: Premier League (Soccer)
 matches.set('1', {
   fixtureId: 1,
+  sport: 'soccer',
+  country: 'England',
   homeTeam: 'Manchester United',
   awayTeam: 'Liverpool',
+  kickoffDate: '2026-11-21T17:30:00Z',
+  league: 'Premier League',
+  venue: 'Old Trafford, Manchester',
+  round: 'Matchday 12',
   status: 'scheduled',
+  lineupInfo: {
+    home: {
+      formation: '4-2-3-1',
+      status: 'Confirmed',
+      keyPlayers: ['Bruno Fernandes', 'Marcus Rashford', 'Kobbie Mainoo'],
+      absentees: ['Luke Shaw (Hamstring)', 'Lisandro Martínez (Doubtful)'],
+      tacticalStyle: 'Direct transition with rapid wing counters',
+    },
+    away: {
+      formation: '4-3-3',
+      status: 'Confirmed',
+      keyPlayers: ['Mohamed Salah', 'Alexis Mac Allister', 'Virgil van Dijk'],
+      absentees: ['Alisson Becker (Hamstring)'],
+      tacticalStyle: 'High-intensity counter-pressing and fluid wide rotation',
+    },
+  },
+  stats: {
+    homeForm: ['W', 'D', 'W', 'L', 'W'],
+    awayForm: ['W', 'W', 'W', 'D', 'W'],
+    homeAvgScored: 1.7,
+    homeAvgConceded: 1.3,
+    awayAvgScored: 2.3,
+    awayAvgConceded: 0.9,
+    homeCleanSheetPct: 30,
+    awayCleanSheetPct: 50,
+    h2hSummary: 'Last 5 H2H: Liverpool 3 wins, Man Utd 1 win, 1 draw (avg 3.4 goals/game)',
+  },
+  odds: {
+    home: 3.20,
+    draw: 3.80,
+    away: 2.10,
+    over25: 1.65,
+    under25: 2.25,
+    bttsYes: 1.55,
+    bttsNo: 2.40,
+    bookmaker: 'BetFair Exchange',
+  },
 });
+
+// 2. Spain: La Liga (Soccer)
 matches.set('2', {
   fixtureId: 2,
+  sport: 'soccer',
+  country: 'Spain',
   homeTeam: 'Real Madrid',
   awayTeam: 'Barcelona',
+  kickoffDate: '2026-11-22T20:00:00Z',
+  league: 'La Liga',
+  venue: 'Santiago Bernabéu, Madrid',
+  round: 'Matchday 11 (El Clásico)',
   status: 'scheduled',
+  lineupInfo: {
+    home: {
+      formation: '4-3-1-2',
+      status: 'Predicted',
+      keyPlayers: ['Vinicius Jr', 'Jude Bellingham', 'Kylian Mbappé', 'Fede Valverde'],
+      absentees: ['David Alaba (Knee)', 'Courtois (Adductor)'],
+      tacticalStyle: 'Direct vertical attacks and dynamic half-space overloads',
+    },
+    away: {
+      formation: '4-2-3-1',
+      status: 'Predicted',
+      keyPlayers: ['Lamine Yamal', 'Robert Lewandowski', 'Raphinha', 'Pedri'],
+      absentees: ['Ter Stegen (Knee)', 'Araújo (Hamstring)'],
+      tacticalStyle: 'High defensive line, aggressive offside trap, and vertical possession',
+    },
+  },
+  stats: {
+    homeForm: ['W', 'W', 'W', 'D', 'W'],
+    awayForm: ['W', 'W', 'W', 'W', 'L'],
+    homeAvgScored: 2.4,
+    homeAvgConceded: 0.8,
+    awayAvgScored: 2.8,
+    awayAvgConceded: 1.1,
+    homeCleanSheetPct: 55,
+    awayCleanSheetPct: 45,
+    h2hSummary: 'Last 5 H2H: Real Madrid 3 wins, Barcelona 2 wins (avg 3.8 goals/game)',
+  },
+  odds: {
+    home: 2.05,
+    draw: 3.75,
+    away: 3.40,
+    over25: 1.50,
+    under25: 2.50,
+    bttsYes: 1.48,
+    bttsNo: 2.60,
+    bookmaker: 'Pinnacle',
+  },
 });
 
-// --- API-FOOTBALL INTEGRATION ---
-// Fetches historical match results to train Poisson ratings
-// Documentation: https://www.api-football.com/documentation-v3
-// Free tier: 100 requests/day, season coverage varies by league
+// 3. Italy: Serie A (Soccer)
+matches.set('3', {
+  fixtureId: 3,
+  sport: 'soccer',
+  country: 'Italy',
+  homeTeam: 'Inter',
+  awayTeam: 'Milan',
+  kickoffDate: '2026-11-23T19:45:00Z',
+  league: 'Serie A',
+  venue: 'San Siro, Milan',
+  round: 'Derby della Madonnina',
+  status: 'scheduled',
+  lineupInfo: {
+    home: {
+      formation: '3-5-2',
+      status: 'Confirmed',
+      keyPlayers: ['Lautaro Martínez', 'Marcus Thuram', 'Nicolò Barella'],
+      absentees: ['Hakan Çalhanoğlu (Doubtful)'],
+      tacticalStyle: 'Wing-back overloads and structured defensive solidity',
+    },
+    away: {
+      formation: '4-2-3-1',
+      status: 'Confirmed',
+      keyPlayers: ['Rafael Leão', 'Christian Pulisic', 'Théo Hernandez'],
+      absentees: ['Ismaël Bennacer (Calf)'],
+      tacticalStyle: 'Left-wing isolation and explosive transition speed',
+    },
+  },
+  stats: {
+    homeForm: ['W', 'W', 'W', 'D', 'W'],
+    awayForm: ['W', 'L', 'W', 'W', 'D'],
+    homeAvgScored: 2.2,
+    homeAvgConceded: 0.7,
+    awayAvgScored: 1.8,
+    awayAvgConceded: 1.2,
+    homeCleanSheetPct: 55,
+    awayCleanSheetPct: 35,
+    h2hSummary: 'Last 5 H2H: Inter 4 wins, Milan 1 win (avg 2.8 goals/game)',
+  },
+  odds: {
+    home: 1.95,
+    draw: 3.60,
+    away: 3.85,
+    over25: 1.75,
+    under25: 2.05,
+    bookmaker: 'Bet365',
+  },
+});
 
-interface ApiFootballFixture {
-  fixture: {
-    id: number;
-    date: string;
-    timestamp: number;
-    status: { long: string; short: string; elapsed: number };
-  };
-  league: { id: number; season: number; round: string };
-  teams: {
-    home: { id: number; name: string; winner: boolean };
-    away: { id: number; name: string; winner: boolean };
-  };
-  goals: { home: number; away: number };
-  score: {
-    halftime: { home: number; away: number };
-    fulltime: { home: number; away: number };
-    extratime: { home: number | null; away: number | null };
-    penalty: { home: number | null; away: number | null };
-  };
-}
+// 4. Germany: Bundesliga (Soccer)
+matches.set('4', {
+  fixtureId: 4,
+  sport: 'soccer',
+  country: 'Germany',
+  homeTeam: 'Bayern Munich',
+  awayTeam: 'Borussia Dortmund',
+  kickoffDate: '2026-11-23T17:30:00Z',
+  league: 'Bundesliga',
+  venue: 'Allianz Arena, Munich',
+  round: 'Matchday 11 (Der Klassiker)',
+  status: 'scheduled',
+  lineupInfo: {
+    home: {
+      formation: '4-2-3-1',
+      status: 'Predicted',
+      keyPlayers: ['Harry Kane', 'Jamal Musiala', 'Michael Olise'],
+      absentees: ['Hiroki Ito (Metatarsal)'],
+      tacticalStyle: 'High counter-press and relentless wing overloads',
+    },
+    away: {
+      formation: '4-3-3',
+      status: 'Predicted',
+      keyPlayers: ['Serhou Guirassy', 'Julian Brandt', 'Nico Schlotterbeck'],
+      absentees: ['Karim Adeyemi (Muscle)'],
+      tacticalStyle: 'Rapid vertical wing breaks and physical presence',
+    },
+  },
+  stats: {
+    homeForm: ['W', 'W', 'W', 'W', 'D'],
+    awayForm: ['L', 'W', 'L', 'W', 'D'],
+    homeAvgScored: 3.1,
+    homeAvgConceded: 1.0,
+    awayAvgScored: 1.9,
+    awayAvgConceded: 1.7,
+    homeCleanSheetPct: 40,
+    awayCleanSheetPct: 20,
+    h2hSummary: 'Last 5 H2H: Bayern 3 wins, Dortmund 1 win, 1 draw (avg 4.2 goals/game)',
+  },
+  odds: {
+    home: 1.50,
+    draw: 4.80,
+    away: 5.80,
+    over25: 1.40,
+    under25: 3.00,
+    bookmaker: 'Pinnacle',
+  },
+});
 
-interface ApiFootballResponse {
-  get: string;
-  parameters: { league: number; season: number };
-  errors: Array<{ code: number; get: string; message: string }>;
-  results: number;
-  paging: { current: number; total: number };
-  response: ApiFootballFixture[];
-}
+// 5. USA: Major League Soccer (Soccer)
+matches.set('5', {
+  fixtureId: 5,
+  sport: 'soccer',
+  country: 'USA',
+  homeTeam: 'Inter Miami',
+  awayTeam: 'LAFC',
+  kickoffDate: '2026-11-24T00:30:00Z',
+  league: 'Major League Soccer (MLS)',
+  venue: 'Chase Stadium, Fort Lauderdale',
+  round: 'MLS Cup Playoff',
+  status: 'scheduled',
+  lineupInfo: {
+    home: {
+      formation: '4-3-3',
+      status: 'Confirmed',
+      keyPlayers: ['Lionel Messi', 'Luis Suárez', 'Sergio Busquets', 'Jordi Alba'],
+      absentees: ['Facundo Farías (ACL)'],
+      tacticalStyle: 'Centrally anchored playmaking with Messi roaming',
+    },
+    away: {
+      formation: '4-3-3',
+      status: 'Confirmed',
+      keyPlayers: ['Denis Bouanga', 'Olivier Giroud', 'Mateusz Bogusz'],
+      absentees: ['Cristian Olivera (Suspended)'],
+      tacticalStyle: 'Direct wing speed and target forward hold-up play',
+    },
+  },
+  stats: {
+    homeForm: ['W', 'W', 'W', 'W', 'D'],
+    awayForm: ['W', 'W', 'D', 'W', 'L'],
+    homeAvgScored: 2.6,
+    homeAvgConceded: 1.4,
+    awayAvgScored: 2.1,
+    awayAvgConceded: 1.3,
+    homeCleanSheetPct: 25,
+    awayCleanSheetPct: 30,
+    h2hSummary: 'Last 3 H2H: Inter Miami 2 wins, LAFC 1 win (avg 3.7 goals/game)',
+  },
+  odds: {
+    home: 1.85,
+    draw: 3.90,
+    away: 3.70,
+    over25: 1.48,
+    under25: 2.60,
+    bookmaker: 'DraftKings',
+  },
+});
 
-// Fetch historical fixtures from API-Football for a given league and season
-async function fetchHistoricalFixtures(
-  leagueId: number,
-  season: number,
-  fromDate?: string,
-  toDate?: string
-): Promise<ApiFootballFixture[]> {
-  try {
-    const url = new URL(
-      'https://v3.football.api-sports.io/fixtures'
+// 6. USA: Basketball (NBA)
+matches.set('6', {
+  fixtureId: 6,
+  sport: 'basketball',
+  country: 'USA',
+  homeTeam: 'Boston Celtics',
+  awayTeam: 'Los Angeles Lakers',
+  kickoffDate: '2026-11-22T01:30:00Z',
+  league: 'NBA',
+  venue: 'TD Garden, Boston',
+  round: 'Regular Season',
+  status: 'scheduled',
+  lineupInfo: {
+    home: {
+      formation: 'Starting 5',
+      status: 'Confirmed',
+      keyPlayers: ['Jayson Tatum', 'Jaylen Brown', 'Derrick White', 'Jrue Holiday', 'Kristaps Porzingis'],
+      absentees: ['None'],
+      tacticalStyle: 'Five-out perimeter shooting and switch-heavy perimeter defense',
+    },
+    away: {
+      formation: 'Starting 5',
+      status: 'Confirmed',
+      keyPlayers: ['LeBron James', 'Anthony Davis', 'Austin Reaves', "D'Angelo Russell"],
+      absentees: ['Jarred Vanderbilt (Foot)'],
+      tacticalStyle: 'Paint dominance, pick-and-roll creation, and interior rim protection',
+    },
+  },
+  sportSpecificStats: {
+    homePace: 101.4,
+    awayPace: 100.8,
+    homeORtg: 122.5,
+    homeDRtg: 109.8,
+    awayORtg: 115.2,
+    awayDRtg: 114.1,
+  },
+  stats: {
+    homeForm: ['W', 'W', 'W', 'W', 'L'],
+    awayForm: ['W', 'L', 'W', 'L', 'W'],
+    homeAvgScored: 120.4,
+    homeAvgConceded: 109.2,
+    awayAvgScored: 114.5,
+    awayAvgConceded: 113.8,
+    homeCleanSheetPct: 0,
+    awayCleanSheetPct: 0,
+    h2hSummary: 'Last 5 H2H: Celtics 4 wins, Lakers 1 win (Avg total 231.4 pts)',
+  },
+});
+
+// 7. USA/Canada: Ice Hockey (NHL)
+matches.set('7', {
+  fixtureId: 7,
+  sport: 'hockey',
+  country: 'USA',
+  homeTeam: 'Edmonton Oilers',
+  awayTeam: 'Florida Panthers',
+  kickoffDate: '2026-11-22T03:00:00Z',
+  league: 'NHL',
+  venue: 'Rogers Place, Edmonton',
+  round: 'Stanley Cup Rematch',
+  status: 'scheduled',
+  lineupInfo: {
+    home: {
+      formation: 'Lines 1-4 + Goalie',
+      status: 'Confirmed',
+      keyPlayers: ['Connor McDavid', 'Leon Draisaitl', 'Stuart Skinner (Starting G)'],
+      absentees: ['Evander Kane (Hip)'],
+      tacticalStyle: 'Elite rush offense and generational power play unit',
+    },
+    away: {
+      formation: 'Lines 1-4 + Goalie',
+      status: 'Confirmed',
+      keyPlayers: ['Aleksander Barkov', 'Matthew Tkachuk', 'Sergei Bobrovsky (Starting G)'],
+      absentees: ['None'],
+      tacticalStyle: 'Relentless forecheck, physical neutral-zone trap, and clutch goaltending',
+    },
+  },
+  sportSpecificStats: {
+    homeAttack: 3.5,
+    homeGAA: 2.7,
+    awayAttack: 3.2,
+    awayGAA: 2.5,
+  },
+  stats: {
+    homeForm: ['W', 'W', 'L', 'W', 'W'],
+    awayForm: ['W', 'W', 'W', 'L', 'W'],
+    homeAvgScored: 3.6,
+    homeAvgConceded: 2.8,
+    awayAvgScored: 3.4,
+    awayAvgConceded: 2.6,
+    homeCleanSheetPct: 15,
+    awayCleanSheetPct: 20,
+    h2hSummary: 'Stanley Cup Final rematch; Florida won series 4-3',
+  },
+});
+
+// 8. International: Tennis (ATP)
+matches.set('8', {
+  fixtureId: 8,
+  sport: 'tennis',
+  country: 'International',
+  homeTeam: 'Carlos Alcaraz',
+  awayTeam: 'Jannik Sinner',
+  kickoffDate: '2026-11-23T14:00:00Z',
+  league: 'ATP Masters 1000',
+  venue: 'Centre Court, Indoor Hard',
+  round: 'Final',
+  status: 'scheduled',
+  lineupInfo: {
+    home: {
+      formation: 'Singles',
+      status: 'Confirmed',
+      keyPlayers: ['Carlos Alcaraz (World No. 2)'],
+      absentees: ['Full Fitness'],
+      tacticalStyle: 'All-court aggression, heavy topspin forehand, and drop-shot variety',
+    },
+    away: {
+      formation: 'Singles',
+      status: 'Confirmed',
+      keyPlayers: ['Jannik Sinner (World No. 1)'],
+      absentees: ['Full Fitness'],
+      tacticalStyle: 'Blistering baseline velocity, explosive backhand, and improved first serve',
+    },
+  },
+  sportSpecificStats: {
+    player1Hold: 0.87,
+    player2Hold: 0.89,
+    surface: 'Hard',
+  },
+  stats: {
+    homeForm: ['W', 'W', 'W', 'W', 'W'],
+    awayForm: ['W', 'W', 'W', 'W', 'W'],
+    homeAvgScored: 2.1,
+    homeAvgConceded: 0.4,
+    awayAvgScored: 2.3,
+    awayAvgConceded: 0.3,
+    homeCleanSheetPct: 70,
+    awayCleanSheetPct: 75,
+    h2hSummary: 'H2H Tied 6-6 (all-time great rivalry)',
+  },
+});
+
+// Compute prediction based on sport and country context
+export function computeMatchPrediction(match: MatchData): any {
+  if (match.sport === 'basketball') {
+    const s = match.sportSpecificStats || {};
+    return predictBasketballNBA(
+      match.homeTeam,
+      match.awayTeam,
+      s.homePace ?? 101.4,
+      s.awayPace ?? 100.8,
+      s.homeORtg ?? 122.5,
+      s.homeDRtg ?? 109.8,
+      s.awayORtg ?? 115.2,
+      s.awayDRtg ?? 114.1,
+      match.lineupInfo ? [`${match.homeTeam}: ${match.lineupInfo.home.keyPlayers.join(', ')}`, `${match.awayTeam}: ${match.lineupInfo.away.keyPlayers.join(', ')}`] : []
     );
-    url.searchParams.set('league', leagueId.toString());
-    url.searchParams.set('season', season.toString());
-    if (fromDate) url.searchParams.set('from', fromDate);
-    if (toDate) url.searchParams.set('to', toDate);
+  }
+  if (match.sport === 'hockey') {
+    const s = match.sportSpecificStats || {};
+    return predictHockeyNHL(
+      match.homeTeam,
+      match.awayTeam,
+      s.homeAttack ?? 3.5,
+      s.homeGAA ?? 2.7,
+      s.awayAttack ?? 3.2,
+      s.awayGAA ?? 2.5,
+      match.lineupInfo ? [`Goalies: ${match.lineupInfo.home.keyPlayers[2]} vs ${match.lineupInfo.away.keyPlayers[2]}`] : []
+    );
+  }
+  if (match.sport === 'tennis') {
+    const s = match.sportSpecificStats || {};
+    return predictTennis(
+      match.homeTeam,
+      match.awayTeam,
+      s.player1Hold ?? 0.87,
+      s.player2Hold ?? 0.89,
+      s.surface ?? 'Hard',
+      [`Surface: ${s.surface || 'Hard'} Court`]
+    );
+  }
 
-    const response = await axios.get<ApiFootballResponse>(url.toString(), {
-      headers: { 'x-apisports-key': API_FOOTBALL_KEY },
-    });
+  // Default: Soccer
+  const lineupMod = deriveLineupModifier(match);
+  return predictPoissonDC(match.homeTeam, match.awayTeam, dynamicRatingEngine.getAsMap(), match.liveStats, lineupMod);
+}
 
-    // Handle errors in response
-    if (response.data.errors && response.data.errors.length > 0) {
-      console.error('API-Football errors:', response.data.errors);
-      return [];
+// Compute lineup modifier from team absentees and formation
+function deriveLineupModifier(match: MatchData): LineupModifier {
+  let homeAttackMod = 1.0;
+  let homeDefMod = 1.0;
+  let awayAttackMod = 1.0;
+  let awayDefMod = 1.0;
+  const notes: string[] = [];
+
+  if (match.lineupInfo) {
+    const homeAbs = match.lineupInfo.home.absentees;
+    const awayAbs = match.lineupInfo.away.absentees;
+
+    if (homeAbs.some((a) => /Saliba|Alisson|Martínez|van Dijk|Courtois|Rodri/i.test(a))) {
+      homeDefMod *= 1.08;
+      notes.push(`Lineup Alert: ${match.homeTeam} missing key defensive personnel.`);
+    }
+    if (awayAbs.some((a) => /Saliba|Alisson|Martínez|van Dijk|Courtois|Rodri/i.test(a))) {
+      awayDefMod *= 1.08;
+      notes.push(`Lineup Alert: ${match.awayTeam} missing key defensive personnel.`);
     }
 
-    // Filter to completed matches with valid full-time goals
-    return response.data.response
-      .filter(
-        (f) =>
-          f.fixture.status.short === 'FT' &&
-          f.goals !== undefined &&
-          f.goals.home !== null &&
-          f.goals.away !== null
-      )
-      .sort(
-        (a, b) => new Date(a.fixture.date).getTime() - new Date(b.fixture.date).getTime()
-      );
-  } catch (error) {
-    // TypeScript's 'error' type is 'unknown' in catch blocks; extract message safely
-    const errMessage = error instanceof Error ? error.message : String(error);
-    console.error(
-      `Error fetching fixtures for league ${leagueId}, season ${season}:`,
-      errMessage
-    );
-    return [];
-  }
-}
-
-// Normalize team name for rating lookup (lowercase, trim)
-function normalizeTeamName(name: string): string {
-  return name.toLowerCase().trim();
-}
-
-// Train Poisson ratings from historical match data using a simple GLM approach
-// Returns: team attack/defence ratings, home advantage, matches analyzed
-async function trainPoissonRatings(
-  leagueId: number,
-  season: number,
-  fromDate?: string,
-  toDate?: string
-) {
-  const fixtures = await fetchHistoricalFixtures(leagueId, season, fromDate, toDate);
-
-  if (fixtures.length === 0) {
-    console.warn(
-      `No historical fixtures found for league ${leagueId}, season ${season}`
-    );
-    // Return default ratings if no data available
-    return {
-      teamRatings: new Map(),
-      homeAdvantage: 1.1,
-      totalMatches: 0,
-    };
-  }
-
-  console.log(`Training Poisson ratings on ${fixtures.length} historical matches`);
-
-  // Build long format data: one row per team's goals in a match
-  // Each match generates two rows: home team goals (is_home=1) and away team goals (is_home=0)
-  const goalRows: Array<{ goals: number; teamId: string; opponentId: string; isHome: number }> = [];
-  const teamSet = new Set<string>();
-
-  for (const f of fixtures) {
-    const homeTeam = normalizeTeamName(f.teams.home.name);
-    const awayTeam = normalizeTeamName(f.teams.away.name);
-    const homeGoals = f.goals?.home ?? 0;
-    const awayGoals = f.goals?.away ?? 0;
-
-    teamSet.add(homeTeam);
-    teamSet.add(awayTeam);
-
-    // Home team row: goals scored when playing at home
-    goalRows.push({ goals: homeGoals, teamId: homeTeam, opponentId: awayTeam, isHome: 1 });
-    // Away team row: goals scored when playing away
-    goalRows.push({ goals: awayGoals, teamId: awayTeam, opponentId: homeTeam, isHome: 0 });
-  }
-
-  const totalMatches = fixtures.length;
-
-  // Calculate goals per team (home and away games)
-  const teamGoals: Map<string, { homeGoals: number; awayGoals: number; homeGames: number; awayGames: number }> = new Map();
-
-  for (const row of goalRows) {
-    const existing = teamGoals.get(row.teamId) || {
-      homeGoals: 0,
-      awayGoals: 0,
-      homeGames: 0,
-      awayGames: 0,
-    };
-
-    if (row.isHome === 1) {
-      existing.homeGoals += row.goals;
-      existing.homeGames += 1;
-    } else {
-      existing.awayGoals += row.goals;
-      existing.awayGames += 1;
+    if (homeAbs.some((a) => /Haaland|Saka|Kane|Mbappé|Vinicius|Salah/i.test(a))) {
+      homeAttackMod *= 0.88;
+      notes.push(`Lineup Alert: ${match.homeTeam} missing primary goalscorer.`);
     }
-
-    teamGoals.set(row.teamId, existing);
-  }
-
-  // Calculate league average goals
-  const totalGoalsScored = goalRows.reduce((sum, row) => sum + row.goals, 0);
-  const leagueAvgGoals = totalGoalsScored / goalRows.length;
-
-  // Calculate home advantage: home teams typically score more
-  const homeGoalsRows = goalRows.filter(r => r.isHome === 1);
-  const awayGoalsRows = goalRows.filter(r => r.isHome === 0);
-  const avgHomeGoals = homeGoalsRows.length > 0
-    ? homeGoalsRows.reduce((sum, row) => sum + row.goals, 0) / homeGoalsRows.length
-    : leagueAvgGoals;
-  const avgAwayGoals = awayGoalsRows.length > 0
-    ? awayGoalsRows.reduce((sum, row) => sum + row.goals, 0) / awayGoalsRows.length
-    : leagueAvgGoals;
-  // Avoid division by zero for home advantage calculation
-  const homeAdvantage = avgAwayGoals > 0 ? avgHomeGoals / avgAwayGoals : 1.1;
-
-  // Build team ratings map
-  // attack: average goals scored (home teams) / league average
-  // defence: average goals conceded (opponents' scoring against) / league average
-  const teamAttack: Map<string, number> = new Map();
-  const teamConcede: Map<string, number> = new Map();
-
-  for (const row of goalRows) {
-    const existingAttack = teamAttack.get(row.teamId) || 0;
-    const existingConcede = teamConcede.get(row.teamId) || 0;
-
-    if (row.isHome === 1) {
-      teamAttack.set(row.teamId, existingAttack + row.goals);
-      teamConcede.set(row.opponentId, existingConcede + row.goals); // opponent conceded these goals
-    } else {
-      teamAttack.set(row.teamId, existingAttack + row.goals);
-      teamConcede.set(row.opponentId, existingConcede + row.goals);
+    if (awayAbs.some((a) => /Haaland|Saka|Kane|Mbappé|Vinicius|Salah/i.test(a))) {
+      awayAttackMod *= 0.88;
+      notes.push(`Lineup Alert: ${match.awayTeam} missing primary attacking focal point.`);
     }
-  }
-
-  // Normalize attack and defence ratings
-  const teamRatings = new Map<string, {
-    homeAttack: number;
-    awayAttack: number;
-    homeDefence: number;
-    awayDefence: number;
-    homeAdvantage: number;
-    matchesAnalyzed: number;
-  }>();
-
-  for (const team of teamSet) {
-    const teamHomeGames = teamGoals.get(team)?.homeGames || 0;
-    const teamAwayGames = teamGoals.get(team)?.awayGames || 0;
-    const teamHomeGoals = teamGoals.get(team)?.homeGoals || 0;
-    const teamAwayGoals = teamGoals.get(team)?.awayGoals || 0;
-    const gamesPlayed = teamHomeGames + teamAwayGames || 1;
-    const avgScoredHome = teamHomeGames > 0 ? teamHomeGoals / teamHomeGames : 0;
-    const avgScoredAway = teamAwayGames > 0 ? teamAwayGoals / teamAwayGames : 0;
-    const avgConcededHome = teamConcede.get(team) || 0;
-    const avgConcededAway = teamConcede.get(team) || 0;
-
-    // Attack rating: goals scored divided by expected (league avg * homeAdvantage if home)
-    const attackHome = gamesPlayed > 0 && leagueAvgGoals > 0 ? avgScoredHome / leagueAvgGoals : 1.0;
-    const attackAway = gamesPlayed > 0 && leagueAvgGoals > 0 ? avgScoredAway / leagueAvgGoals : 1.0;
-
-    // Defence rating: goals conceded divided by expected
-    // Lower is better (concedes less)
-    const defenceHome = gamesPlayed > 0 && leagueAvgGoals > 0 ? avgConcededHome / leagueAvgGoals : 1.0;
-    const defenceAway = gamesPlayed > 0 && leagueAvgGoals > 0 ? avgConcededAway / leagueAvgGoals : 1.0;
-
-    teamRatings.set(team, {
-      homeAttack: attackHome,
-      awayAttack: attackAway,
-      homeDefence: defenceHome,
-      awayDefence: defenceAway,
-      homeAdvantage: homeAdvantage,
-      matchesAnalyzed: fixtures.length,
-    });
   }
 
   return {
-    teamRatings,
-    homeAdvantage,
-    totalMatches: fixtures.length,
+    homeAttackMultiplier: homeAttackMod,
+    homeDefenceMultiplier: homeDefMod,
+    awayAttackMultiplier: awayAttackMod,
+    awayDefenceMultiplier: awayDefMod,
+    lineupNotes: notes,
   };
 }
 
-// Poisson probability mass function
-function poissonPMF(k: number, lambda: number): number {
-  if (k < 0) return 0;
-  return (Math.pow(lambda, k) * Math.exp(-lambda)) / factorial(k);
-}
+export { oddsToImpliedProb, calculateEV, calculateKellyFraction, identifyValueBets };
 
-// Factorial (small integers only)
-function factorial(n: number): number {
-  let result = 1;
-  for (let i = 2; i <= n; i++) result *= i;
-  return result;
-}
-
-// Dixon-Coles adjustment for low scorelines
-function dcAdjustment(score1: number, score2: number, lambda1: number, lambda2: number, rho: number): number {
-  // rho is the Dixon-Coles correlation parameter (typically -0.12 to -0.15)
-  if (score1 === 0 && score2 === 0) return 1 - rho;
-  if (score1 === 0 && score2 === 1) return rho;
-  if (score1 === 1 && score2 === 0) return rho;
-  if (score1 === 1 && score2 === 1) return 1 - rho;
-  return 1;
-}
-
-// Main prediction function using Poisson + Dixon-Coles
-function predictPoissonDC(
-  homeTeamName: string,
-  awayTeamName: string,
-  teamRatings?: Map<string, { homeAttack: number; awayAttack: number; homeDefence: number; awayDefence: number; homeAdvantage: number; matchesAnalyzed: number }>
-) {
-  // Look up ratings or use defaults
-  const homeModel = teamRatings?.get(homeTeamName.toLowerCase()) || {
-    homeAttack: 1.2,
-    awayAttack: 1.1,
-    homeDefence: 0.8,
-    awayDefence: 0.9,
-    homeAdvantage: 1.1,
-    matchesAnalyzed: 0,
-  };
-  const awayModel = teamRatings?.get(awayTeamName.toLowerCase()) || {
-    homeAttack: 1.2,
-    awayAttack: 1.1,
-    homeDefence: 0.8,
-    awayDefence: 0.9,
-    homeAdvantage: 1.1,
-    matchesAnalyzed: 0,
-  };
-
-  // Calculate expected goals
-  const lambdaHome = homeModel.homeAttack * awayModel.awayDefence * homeModel.homeAdvantage;
-  const lambdaAway = awayModel.awayAttack * homeModel.homeDefence;
-
-  const expectedGoals = { home: lambdaHome, away: lambdaAway };
-
-  // Dixon-Coles rho parameter (adjusts low scorelines)
-  const rho = -0.13;
-
-  // Calculate probabilities using Poisson + Dixon-Coles
-  // Sum probabilities of all relevant scorelines (0-0 through 3-3)
-  let pHomeWin = 0, pDraw = 0, pAwayWin = 0;
-  const scorelineProbs: { score: string; probability: number }[] = [];
-
-  for (let h = 0; h <= 4; h++) {
-    for (let a = 0; a <= 4; a++) {
-      // Base Poisson probability
-      const baseProb = poissonPMF(h, lambdaHome) * poissonPMF(a, lambdaAway);
-
-      // Dixon-Coles adjustment
-      const dcAdj = dcAdjustment(h, a, lambdaHome, lambdaAway, rho);
-      const adjProb = baseProb * dcAdj;
-
-      // Accumulate outcome probabilities
-      if (h > a) {
-        pHomeWin += adjProb;
-      } else if (h < a) {
-        pAwayWin += adjProb;
-      } else {
-        pDraw += adjProb;
-      }
-
-      // Track top scorelines (limit to 10)
-      if (scorelineProbs.length < 10) {
-        scorelineProbs.push({ score: `${h}-${a}`, probability: Math.round(adjProb * 10000) / 100 });
-      }
-    }
-  }
-
-  // Normalize probabilities
-  const total = pHomeWin + pDraw + pAwayWin;
-  const homeWinProb = total > 0 ? Math.round((pHomeWin / total) * 10000) / 100 : 33.33;
-  const drawProb = total > 0 ? Math.round((pDraw / total) * 10000) / 100 : 33.33;
-  const awayWinProb = total > 0 ? Math.round((pAwayWin / total) * 10000) / 100 : 33.33;
-
-  let predictedWinner = 'draw';
-  if (homeWinProb > awayWinProb) predictedWinner = homeTeamName;
-  else if (awayWinProb > homeWinProb) predictedWinner = awayTeamName;
-
-  return {
-    expectedGoals,
-    outcomeProbabilities: { homeWin: homeWinProb, draw: drawProb, awayWin: awayWinProb },
-    topScorelines: scorelineProbs.slice(0, 10),
-  };
-}
-
-// --- VALUE BETTING / PROFITABILITY IDENTIFICATION ---
-
-function oddsToImpliedProb(odds: number): number {
-  if (odds <= 0) return 0;
-  return 1 / odds;
-}
-
-function calculateEV(modelProb: number, odds: number): number {
-  if (odds <= 1) return -1;
-  const stake = 1;
-  const profit = odds - 1;
-  const winEV = modelProb * profit;
-  const loseEV = (1 - modelProb) * (-stake);
-  return winEV + loseEV;
-}
-
-function calculateKellyFraction(modelProb: number, odds: number): number {
-  if (odds <= 1) return 0;
-  const b = odds - 1;
-  const p = modelProb;
-  const q = 1 - modelProb;
-  const f = (b * p - q) / b;
-  if (f < 0) return 0;
-  return Math.max(0, Math.min(f, 1));
-}
-
-interface ValueBet {
-  outcome: string;
-  modelProbability: number;
-  odds: number;
-  impliedProbability: number;
-  edgePercent: number;
-  expectedValue: number;
-  kellyFraction: number;
-  kellyHalfFraction: number;
-  isValueBet: boolean;
-  confidence: 'Low' | 'Medium' | 'High';
-  recommendedStake?: number;
-}
-
-function identifyValueBets(
-  modelProbs: { homeWin: number; draw: number; awayWin: number },
-  odds?: { home: number; draw: number; away: number },
-  bankroll: number = 1000
-) {
-  if (!odds || odds.home <= 0 || odds.draw <= 0 || odds.away <= 0) {
-    return null;
-  }
-
-  const outcomes = [
-    { name: 'Home Win', model: modelProbs.homeWin / 100, odds: odds.home },
-    { name: 'Draw', model: modelProbs.draw / 100, odds: odds.draw },
-    { name: 'Away Win', model: modelProbs.awayWin / 100, odds: odds.away },
-  ];
-
-  const valueBets: ValueBet[] = outcomes.map(out => {
-    const implied = oddsToImpliedProb(out.odds);
-    const edge = out.model - implied;
-    const ev = calculateEV(out.model, out.odds);
-    const kelly = calculateKellyFraction(out.model, out.odds);
-    const kellyHalf = kelly * 0.5;
-    const isValueBet = ev > 0.01; // EV > 1% minimum threshold
-    return {
-      outcome: out.name,
-      modelProbability: parseFloat((out.model * 100).toFixed(2)),
-      odds: out.odds,
-      impliedProbability: parseFloat((implied * 100).toFixed(2)),
-      edgePercent: parseFloat((edge * 100).toFixed(2)),
-      expectedValue: parseFloat(ev.toFixed(4)),
-      kellyFraction: parseFloat((kelly * 100).toFixed(2)),
-      kellyHalfFraction: parseFloat((kellyHalf * 100).toFixed(2)),
-      isValueBet,
-      confidence: ev > 0.05 ? 'High' : ev > 0.02 ? 'Medium' : ev > 0.01 ? 'Low' : 'Low',
-      recommendedStake: parseFloat((bankroll * kellyHalf).toFixed(2)), // Use fractional Kelly (half-Kelly) for risk management
-    };
-  });
-
-  const bestValueBet = valueBets
-    .filter(v => v.isValueBet)
-    .sort((a, b) => b.expectedValue - a.expectedValue)[0];
-
-  return {
-    valueBets,
-    bestValueBet,
-    hasValue: valueBets.some(v => v.isValueBet),
-  };
-}
+// ==================== REST API ENDPOINTS ====================
 
 // Health check endpoint
-app.get('/health', (req: Request, res: Response) => {
-  res.json({ status: 'ok', message: 'Sports Prediction API is running' });
+app.get('/health', (_req: Request, res: Response) => {
+  res.json({
+    status: 'ok',
+    message: 'Sports Prediction & Analytics Intelligence API is active (Multi-Sport & Global Modeling)',
+    version: '1.3.0',
+    currentBankroll: journal.getBankroll(),
+  });
 });
 
-// Get upcoming matches endpoint
-app.get('/matches/upcoming', async (req: Request, res: Response) => {
+// Get upcoming matches with optional sport and country filters
+app.get('/matches/upcoming', (req: Request, res: Response) => {
   try {
-    // In a real app, we'd fetch from API-Football
-    // For now, return simulated data
-    const simulatedMatches: MatchData[] = [
-      {
-        fixtureId: 1,
-        homeTeam: 'Manchester United',
-        awayTeam: 'Liverpool',
-        status: 'scheduled',
-      },
-      {
-        fixtureId: 2,
-        homeTeam: 'Real Madrid',
-        awayTeam: 'Barcelona',
-        status: 'scheduled',
-      },
-    ];
+    const sportFilter = req.query.sport as string | undefined;
+    const countryFilter = req.query.country as string | undefined;
 
-    // Add to matches map for prediction lookups
-    simulatedMatches.forEach(match => {
-      matches.set(match.fixtureId.toString(), match);
-    });
+    let list = Array.from(matches.values());
+    if (sportFilter && sportFilter !== 'all') {
+      list = list.filter((m) => m.sport.toLowerCase() === sportFilter.toLowerCase());
+    }
+    if (countryFilter && countryFilter !== 'all') {
+      list = list.filter((m) => m.country.toLowerCase() === countryFilter.toLowerCase());
+    }
 
-    res.json({ matches: simulatedMatches });
+    res.json({ matches: list });
   } catch (error) {
-    // TypeScript 'error' in catch is 'unknown'; extract message safely
     const errMessage = error instanceof Error ? error.message : String(error);
     console.error('Error fetching matches:', errMessage);
     res.status(500).json({ error: 'Failed to fetch matches' });
@@ -527,71 +615,226 @@ app.get('/matches/:fixtureId/prediction', async (req: Request, res: Response) =>
     return res.status(404).json({ error: 'Match not found' });
   }
 
-  if (match.status !== 'scheduled') {
-    return res.status(400).json({ error: 'Prediction only available for scheduled matches' });
+  const prediction = computeMatchPrediction(match);
+
+  let effectiveOdds: MarketOdds | undefined = match.odds;
+  const qHome = req.query.homeOdds ? parseFloat(req.query.homeOdds as string) : undefined;
+  const qDraw = req.query.drawOdds ? parseFloat(req.query.drawOdds as string) : undefined;
+  const qAway = req.query.awayOdds ? parseFloat(req.query.awayOdds as string) : undefined;
+
+  if (qHome && qDraw && qAway && qHome > 1 && qDraw > 1 && qAway > 1) {
+    effectiveOdds = {
+      home: qHome,
+      draw: qDraw,
+      away: qAway,
+      bookmaker: 'Query Parameter',
+      lastUpdated: new Date().toISOString(),
+    };
   }
 
-  // Use Poisson + Dixon-Coles model for prediction
-  // Train ratings from API-Football historical data (league ID 39 = Premier League, season 2023)
-  let prediction;
-  try {
-    const ratingsResult = await trainPoissonRatings(39, 2023); // Premier League 2023 as default
-    prediction = predictPoissonDC(match.homeTeam, match.awayTeam, ratingsResult.teamRatings);
-  } catch (err) {
-    // TypeScript 'err' is 'unknown' in catch; extract message safely
-    const errMessage = err instanceof Error ? err.message : String(err);
-    console.error('Error training ratings, using defaults:', errMessage);
-    prediction = predictPoissonDC(match.homeTeam, match.awayTeam);
-  }
+  const bankroll = req.query.bankroll ? parseFloat(req.query.bankroll as string) : journal.getBankroll();
+  const valueBetting = effectiveOdds && prediction.outcomeProbabilities
+    ? identifyValueBets(prediction.outcomeProbabilities, effectiveOdds, bankroll)
+    : null;
 
   res.json({
-    fixtureId: match?.fixtureId,
-    homeTeam: match?.homeTeam,
-    awayTeam: match?.awayTeam,
+    fixtureId: match.fixtureId,
+    sport: match.sport,
+    country: match.country,
+    homeTeam: match.homeTeam,
+    awayTeam: match.awayTeam,
+    kickoffDate: match.kickoffDate,
+    league: match.league,
+    venue: match.venue,
+    round: match.round,
+    status: match.status,
+    lineupInfo: match.lineupInfo,
+    stats: match.stats,
+    odds: effectiveOdds,
     prediction,
+    valueBetting,
   });
 });
 
-// Live stats update endpoint (would be called by a background worker in production)
-app.post('/matches/:fixtureId/live-stats', (req: Request, res: Response) => {
-  const fixtureId = req.params.fixtureId as string;
-  const liveStats = req.body;
+// Get comprehensive predictions for all upcoming matches
+app.get('/matches/predictions', (req: Request, res: Response) => {
+  const sportFilter = req.query.sport as string | undefined;
+  const countryFilter = req.query.country as string | undefined;
 
-  const match = matches.get(fixtureId);
-  if (!match) {
-    return res.status(404).json({ error: 'Match not found' });
+  let list = Array.from(matches.values());
+  if (sportFilter && sportFilter !== 'all') {
+    list = list.filter((m) => m.sport.toLowerCase() === sportFilter.toLowerCase());
+  }
+  if (countryFilter && countryFilter !== 'all') {
+    list = list.filter((m) => m.country.toLowerCase() === countryFilter.toLowerCase());
   }
 
-  match.liveStats = liveStats;
-  match.status = 'live';
+  const allPredictions = list.map((m) => ({
+    fixtureId: m.fixtureId,
+    sport: m.sport,
+    country: m.country,
+    homeTeam: m.homeTeam,
+    awayTeam: m.awayTeam,
+    kickoffDate: m.kickoffDate,
+    league: m.league,
+    venue: m.venue,
+    round: m.round,
+    status: m.status,
+    lineupInfo: m.lineupInfo,
+    stats: m.stats,
+    prediction: computeMatchPrediction(m),
+  }));
 
-  res.json({ success: true, match });
+  res.json({
+    total: allPredictions.length,
+    predictions: allPredictions,
+  });
 });
 
-// Result prediction endpoint (after match finished)
+// Scan upcoming matches with odds for value opportunities
+app.get('/matches/value-bets', (req: Request, res: Response) => {
+  const bankroll = req.query.bankroll ? parseFloat(req.query.bankroll as string) : journal.getBankroll();
+  const minEdge = req.query.minEdge ? parseFloat(req.query.minEdge as string) : 1.0;
+
+  const results: Array<{
+    fixtureId: number;
+    match: string;
+    kickoffDate: string;
+    league: string;
+    status: string;
+    prediction: any;
+    valueAnalysis: ValueBetAnalysis;
+  }> = [];
+
+  for (const match of matches.values()) {
+    if (match.status === 'finished' || !match.odds) continue;
+    const pred = computeMatchPrediction(match);
+    if (!pred.outcomeProbabilities) continue;
+    const valueAnalysis = identifyValueBets(pred.outcomeProbabilities, match.odds, bankroll);
+    if (valueAnalysis && valueAnalysis.hasValue) {
+      const qualifying = valueAnalysis.valueBets.filter((v) => v.isValueBet && v.edgePercent >= minEdge);
+      if (qualifying.length > 0) {
+        results.push({
+          fixtureId: match.fixtureId,
+          match: `${match.homeTeam} vs ${match.awayTeam}`,
+          kickoffDate: match.kickoffDate,
+          league: match.league,
+          status: match.status,
+          prediction: pred,
+          valueAnalysis,
+        });
+      }
+    }
+  }
+
+  res.json({
+    totalFound: results.length,
+    bankroll,
+    opportunities: results,
+  });
+});
+
+// Update or set odds for a fixture
+app.post('/matches/:fixtureId/odds', (req: Request, res: Response) => {
+  const fixtureId = req.params.fixtureId as string;
+  const match = matches.get(fixtureId);
+  if (!match) return res.status(404).json({ error: 'Match not found' });
+
+  const { home, draw, away, over25, under25, bttsYes, bttsNo, bookmaker } = req.body;
+  if (!home || !draw || !away || home <= 1 || draw <= 1 || away <= 1) {
+    return res.status(400).json({ error: 'Invalid odds. home, draw, away greater than 1.0 required.' });
+  }
+
+  match.odds = {
+    home: parseFloat(home),
+    draw: parseFloat(draw),
+    away: parseFloat(away),
+    over25: over25 ? parseFloat(over25) : undefined,
+    under25: under25 ? parseFloat(under25) : undefined,
+    bttsYes: bttsYes ? parseFloat(bttsYes) : undefined,
+    bttsNo: bttsNo ? parseFloat(bttsNo) : undefined,
+    bookmaker: bookmaker || 'Manual Ingestion',
+    lastUpdated: new Date().toISOString(),
+  };
+
+  res.json({ success: true, fixtureId: match.fixtureId, odds: match.odds });
+});
+
+// Live stats update endpoint
+app.post('/matches/:fixtureId/live-stats', (req: Request, res: Response) => {
+  const fixtureId = req.params.fixtureId as string;
+  const match = matches.get(fixtureId);
+  if (!match) return res.status(404).json({ error: 'Match not found' });
+
+  const { possession, shots, shotsOnTarget, corners, fouls, homeGoals, awayGoals, elapsedMinutes } = req.body;
+  match.liveStats = {
+    possession: possession !== undefined ? Number(possession) : match.liveStats?.possession ?? 50,
+    shots: shots !== undefined ? Number(shots) : match.liveStats?.shots ?? 0,
+    shotsOnTarget: shotsOnTarget !== undefined ? Number(shotsOnTarget) : match.liveStats?.shotsOnTarget ?? 0,
+    corners: corners !== undefined ? Number(corners) : match.liveStats?.corners ?? 0,
+    fouls: fouls !== undefined ? Number(fouls) : match.liveStats?.fouls ?? 0,
+    homeGoals: homeGoals !== undefined ? Number(homeGoals) : match.homeGoals ?? 0,
+    awayGoals: awayGoals !== undefined ? Number(awayGoals) : match.awayGoals ?? 0,
+    elapsedMinutes: elapsedMinutes !== undefined ? Number(elapsedMinutes) : match.liveStats?.elapsedMinutes ?? 45,
+  };
+
+  if (homeGoals !== undefined) match.homeGoals = Number(homeGoals);
+  if (awayGoals !== undefined) match.awayGoals = Number(awayGoals);
+  match.status = 'live';
+
+  const livePrediction = computeMatchPrediction(match);
+  res.json({ success: true, match, livePrediction });
+});
+
+// Result reporting endpoint
 app.post('/matches/:fixtureId/result', async (req: Request, res: Response) => {
   const fixtureId = req.params.fixtureId as string;
   const { homeGoals, awayGoals } = req.body;
 
   const match = matches.get(fixtureId);
-  if (!match) {
-    return res.status(404).json({ error: 'Match not found' });
+  if (!match) return res.status(404).json({ error: 'Match not found' });
+  if (homeGoals === undefined || awayGoals === undefined) {
+    return res.status(400).json({ error: 'homeGoals and awayGoals are required' });
   }
 
-  match.homeGoals = homeGoals;
-  match.awayGoals = awayGoals;
+  match.homeGoals = Number(homeGoals);
+  match.awayGoals = Number(awayGoals);
   match.status = 'finished';
 
-  // Generate prediction based on actual result for verification
-  let prediction;
-  try {
-    const ratingsResult = await trainPoissonRatings(39, 2023);
-    prediction = predictPoissonDC(match.homeTeam, match.awayTeam, ratingsResult.teamRatings);
-  } catch (err) {
-    // TypeScript 'err' in catch is 'unknown'; extract message safely
-    const errMessage = err instanceof Error ? err.message : String(err);
-    console.error('Error training ratings, using defaults:', errMessage);
-    prediction = predictPoissonDC(match.homeTeam, match.awayTeam);
+  let actualOutcome: 'Home Win' | 'Draw' | 'Away Win';
+  if (match.homeGoals > match.awayGoals) actualOutcome = 'Home Win';
+  else if (match.homeGoals < match.awayGoals) actualOutcome = 'Away Win';
+  else actualOutcome = 'Draw';
+
+  const pendingBets = journal.getBets({ fixtureId: match.fixtureId, status: 'pending' });
+  const settledBets: BetRecord[] = [];
+  for (const b of pendingBets) {
+    const won = b.outcome === actualOutcome;
+    const settled = journal.settleBet(b.id, won ? 'won' : 'lost', `${match.homeGoals}-${match.awayGoals}`);
+    settledBets.push(settled);
+  }
+
+  const prediction = computeMatchPrediction(match);
+
+  // Update Dynamic Bayesian Ratings
+  const ratingUpdates = dynamicRatingEngine.updateFromMatch(
+    match.homeTeam,
+    match.awayTeam,
+    Number(homeGoals),
+    Number(awayGoals),
+    new Date().toISOString(),
+    match.sport
+  );
+
+  // Record Calibration event
+  if (prediction.outcomeProbabilities) {
+    calibrationTracker.recordPrediction({
+      sport: match.sport,
+      match: `${match.homeTeam} vs ${match.awayTeam}`,
+      market: '1X2 Match Winner',
+      predictedProb: prediction.outcomeProbabilities.homeWin,
+      actualOutcome: actualOutcome === 'Home Win',
+    });
   }
 
   res.json({
@@ -599,10 +842,172 @@ app.post('/matches/:fixtureId/result', async (req: Request, res: Response) => {
     homeTeam: match.homeTeam,
     awayTeam: match.awayTeam,
     actualResult: `${homeGoals}-${awayGoals}`,
+    actualOutcome,
     prediction,
+    ratingUpdates,
+    settledBetsCount: settledBets.length,
+    bankrollAfter: journal.getBankroll(),
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`Sports Prediction API running on port ${PORT}`);
+// Prediction records & stats
+app.get('/bets', (req: Request, res: Response) => {
+  const status = req.query.status as string | undefined;
+  const fixtureId = req.query.fixtureId ? parseInt(req.query.fixtureId as string, 10) : undefined;
+  const bets = journal.getBets({ status, fixtureId });
+  res.json({ count: bets.length, bets });
 });
+
+app.post('/bets', (req: Request, res: Response) => {
+  try {
+    const { fixtureId, match, market, outcome, modelProb, odds, stake } = req.body;
+    const bet = journal.placeBet({ fixtureId, match, market, outcome, modelProb, odds, stake });
+    res.json({ success: true, bet, currentBankroll: journal.getBankroll() });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/bets/:id/settle', (req: Request, res: Response) => {
+  try {
+    const bet = journal.settleBet(req.params.id as string, req.body.status, req.body.actualScore);
+    res.json({ success: true, bet, currentBankroll: journal.getBankroll() });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/journal/stats', (_req: Request, res: Response) => {
+  res.json(journal.getStats());
+});
+
+app.post('/backtest', (req: Request, res: Response) => {
+  try {
+    const result = runBacktest(req.body || {});
+    res.json({ success: true, result });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==================== OPTION 1: LIVE FEEDS & INGESTION PIPELINE ====================
+app.get('/api/feed/status', (_req: Request, res: Response) => {
+  res.json(feedManager.getStatus());
+});
+
+app.post('/api/feed/sync', async (req: Request, res: Response) => {
+  try {
+    const result = await feedManager.sync(req.body?.provider);
+    res.json({ success: true, result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/feed/config', (req: Request, res: Response) => {
+  try {
+    const updated = feedManager.updateConfig(req.body || {});
+    res.json({ success: true, config: updated });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+// ==================== OPTION 3: DYNAMIC BAYESIAN RATINGS ====================
+app.get('/ratings/teams', (req: Request, res: Response) => {
+  const sport = req.query.sport as SportType | undefined;
+  const ratings = dynamicRatingEngine.getAllTeams(sport);
+  res.json({ total: ratings.length, ratings });
+});
+
+app.get('/ratings/teams/:teamName/history', (req: Request, res: Response) => {
+  const team = dynamicRatingEngine.getTeam(req.params.teamName as string);
+  res.json({ team: team.team, sport: team.sport, history: team.history, currentRating: team });
+});
+
+// ==================== OPTION 4: MODEL CALIBRATION & RELIABILITY ====================
+app.get('/calibration/metrics', (req: Request, res: Response) => {
+  const sport = req.query.sport as SportType | undefined;
+  const metrics = calibrationTracker.computeMetrics(sport);
+  res.json(metrics);
+});
+
+app.get('/calibration/records', (req: Request, res: Response) => {
+  const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 30;
+  res.json({ records: calibrationTracker.getRecentRecords(limit) });
+});
+
+app.post('/calibration/record', (req: Request, res: Response) => {
+  try {
+    const rec = calibrationTracker.recordPrediction(req.body);
+    res.json({ success: true, record: rec });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ==================== OPTION 5: DAILY DIGEST & EXPORT SYSTEM ====================
+app.get('/digest/daily', (req: Request, res: Response) => {
+  const dateStr = (req.query.date as string) || new Date().toISOString().split('T')[0];
+  const digest = generateDailyDigest(Array.from(matches.values()), dateStr);
+  res.json(digest);
+});
+
+app.get('/export/csv', (_req: Request, res: Response) => {
+  const csv = exportMatchesToCSV(Array.from(matches.values()));
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="arbiter-sports-predictions.csv"');
+  res.send(csv);
+});
+
+app.get('/export/json', (_req: Request, res: Response) => {
+  const jsonStr = exportMatchesToJSON(Array.from(matches.values()));
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', 'attachment; filename="arbiter-sports-predictions.json"');
+  res.send(jsonStr);
+});
+
+app.post('/export/webhook', async (req: Request, res: Response) => {
+  const { webhookUrl, date } = req.body;
+  if (!webhookUrl) return res.status(400).json({ error: 'webhookUrl is required' });
+  const digest = generateDailyDigest(Array.from(matches.values()), date || new Date().toISOString().split('T')[0]);
+  const result = await dispatchWebhook(webhookUrl, digest);
+  res.json(result);
+});
+
+// Serve static client production build if available
+const clientBuildPath = path.resolve(__dirname, '../client/build');
+if (fs.existsSync(clientBuildPath)) {
+  app.use(express.static(clientBuildPath));
+  app.use((req: Request, res: Response, next) => {
+    if (
+      req.path.startsWith('/matches') ||
+      req.path.startsWith('/health') ||
+      req.path.startsWith('/bets') ||
+      req.path.startsWith('/journal') ||
+      req.path.startsWith('/backtest') ||
+      req.path.startsWith('/api/feed') ||
+      req.path.startsWith('/ratings') ||
+      req.path.startsWith('/calibration') ||
+      req.path.startsWith('/digest') ||
+      req.path.startsWith('/export')
+    ) {
+      return next();
+    }
+    const indexPath = path.join(clientBuildPath, 'index.html');
+    if (fs.existsSync(indexPath)) {
+      return res.sendFile(indexPath);
+    }
+    next();
+  });
+}
+
+// Only start listening if this file is executed directly
+let server: import('http').Server | null = null;
+if (require.main === module) {
+  server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Sports Prediction & Analytics API running on port ${PORT}`);
+  });
+}
+
+export { app, server, matches, journal, feedManager, dynamicRatingEngine, calibrationTracker };

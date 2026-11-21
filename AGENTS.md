@@ -9,40 +9,65 @@ Sports prediction app focused on consistent profitability through value identifi
 
 ## What is here
 
-- `src/index.ts`: Express + TypeScript API. Prediction via Poisson + Dixon-Coles. Adds value betting helpers:
-  - `oddsToImpliedProb`, `calculateEV`, `calculateKellyFraction`, `identifyValueBets`
-  - Outputs model probability, implied probability, edge, EV, full/half Kelly, recommended stake
-  - Confidence bands: Low / Medium / High from EV thresholds
-- `dist/index.js`: compiled output
-- `client/`: React frontend (in progress; not needed for API verification)
-- `package.json`: commonjs, `build` and `start` scripts, deps on express/axios/cors
-- `tsconfig.json`: compiles `src` to `dist`, includes types for node/express/axios/cors
+- `src/model.ts`: Multi-sport statistical prediction models:
+  - Soccer: Bivariate Poisson + Dixon-Coles (1997) with non-negative tau adjustments and multi-market calculations (1X2, DC, Totals, BTTS, DNB, Clean Sheets, HT, exact scores).
+  - Basketball (NBA): Possession pace and offensive/defensive rating differential evaluated via normal CDF for Spreads and Totals.
+  - Ice Hockey (NHL): 60-min regulation Poisson coupled with overtime tiebreaker progression + Puck line (+/- 1.5) + Totals.
+  - Tennis (ATP): Barnett-Clarke hierarchical Markov chain hold/break model for match winner, set betting (2-0, 2-1), and game totals.
+- `src/liveIngestion.ts`: Live External Feeds & Ingestion Pipeline:
+  - Connectors for Football-Data.org, API-Football / RapidAPI, TheSportsDB, and Simulated In-Play Stream Generator.
+  - Endpoints: `GET /api/feed/status`, `POST /api/feed/sync`, `POST /api/feed/config`.
+- `src/dynamicRatings.ts`: Dynamic Bayesian Rating Engine with Time-Decay & Stochastic Gradient Updating:
+  - Dixon-Coles attack/defence ratings with Bayesian MAP stochastic gradient parameter updates on post-match result.
+  - Tracks rating progression history and form trends (improving/declining/stable) for 39+ teams across sports.
+  - Endpoints: `GET /ratings/teams`, `GET /ratings/teams/:team/history`.
+- `src/calibration.ts`: Model Calibration & Statistical Reliability Engine:
+  - Calculates Brier Score, Brier Skill Score, Expected Calibration Error (ECE %), Max Calibration Error (MCE %), Log-Loss, and 10-decile Reliability Curve bins.
+  - Endpoints: `GET /calibration/metrics`, `GET /calibration/records`, `POST /calibration/record`.
+- `src/exportAndDigest.ts`: Daily Intelligence Digest, Statistical Ranking, CSV/JSON Exporters & Webhook Dispatcher:
+  - Automated morning brief ranking Top High-Confidence Bankers, Value / Edge Anomalies, and Lineup Absentees.
+  - Endpoints: `GET /digest/daily`, `GET /export/csv`, `GET /export/json`, `POST /export/webhook`.
+- `src/valueBetting.ts`: Value betting & Kelly criterion staking:
+  - `oddsToImpliedProb`, `calculateEV`, `calculateKellyFraction`, `evaluateSingleBet`, `identifyValueBets`
+  - Half-Kelly (default risk-balanced), full-Kelly, and quarter-Kelly staking.
+  - Confidence bands (High / Medium / Low) based on EV thresholds and edge percentage.
+- `src/journal.ts`: Bankroll Journal & Bet Performance Tracking:
+  - `BankrollJournal`: places bets, tracks pending stakes, settles outcomes (`won`, `lost`, `void`).
+  - Metrics: Current Bankroll, Net Profit, ROI %, Win Rate %, Max Drawdown ($ and %), Brier calibration score ($BS = \frac{1}{N}\sum(p - y)^2$), and equity curve.
+- `src/backtest.ts`: Backtesting simulation engine:
+  - Benchmark test suite of historical matches with closing market odds.
+  - Supports `half-kelly`, `full-kelly`, `quarter-kelly`, and `flat-stake` strategies.
+  - Computes final bankroll, peak, max drawdown %, ROI %, and equity curve.
+- `src/index.ts`: Express + TypeScript API server exposing all endpoints.
+- `src/test.ts`: Complete automated verification test suite.
+- `client/`: React frontend with full interactive UI for predictions, odds editing, value bet scanning, 1-click bet placement, bankroll journal, backtest simulation, live feeds, Bayesian ratings, and calibration dashboard.
+- `dist/`: Compiled output from TypeScript.
 
 ## Verified commands
 
-- `npm install` (needs dependencies; install in workspace before build/start)
-- `npm run build` -> `tsc` (should exit 0)
-- `npm start` starts the API on port 3000 by default (`PORT` env can override)
+- `npm install` (installs backend dependencies)
+- `npm run build` -> `tsc -p tsconfig.json` (exits 0)
+- `npm test` -> `tsc -p tsconfig.json && node dist/test.js` (runs all unit and live HTTP tests, exits 0)
+- `npm start` -> `node dist/index.js` (starts the API on port 3000 or `PORT` env)
+- `cd client && npm run build` -> builds client production bundle cleanly with zero warnings
 
 ## Main API surface
 
-- `GET /health`
-- `GET /matches/upcoming`
-- `GET /matches/:fixtureId/prediction`
-- `POST /matches/:fixtureId/result`
-- `POST /matches/:fixtureId/live-stats`
+- `GET /health` - API status, version, and current bankroll
+- `GET /matches/upcoming` - List upcoming and in-play fixtures with current market odds
+- `GET /matches/:fixtureId/prediction` - Poisson + Dixon-Coles prediction, expected goals, outcome probabilities, top scorelines, and value bet analysis (supports query params `homeOdds`, `drawOdds`, `awayOdds`, `bankroll`)
+- `POST /matches/:fixtureId/odds` - Ingest / update market odds for a match
+- `GET /matches/value-bets` - Scan all matches and return all value betting opportunities ranked by EV
+- `POST /matches/:fixtureId/live-stats` - Submit in-play match statistics (possession, shots, goals, minute) and receive updated live prediction
+- `POST /matches/:fixtureId/result` - Record final match score, auto-settle any pending bets on this fixture, and update bankroll
+- `GET /bets` - List all bets in the journal (filter by `status` or `fixtureId`)
+- `POST /bets` - Record a placed bet (fixtureId, match, outcome, odds, stake, EV)
+- `POST /bets/:id/settle` - Manually settle a bet (`won`, `lost`, `void`)
+- `GET /journal/stats` - Bankroll summary, ROI, win rate, max drawdown, and Brier calibration score
+- `POST /backtest` - Run backtesting simulation across historical matches with Kelly / flat stake strategies
 
-Prediction endpoints use the model and can return `prediction` with expected goals, outcome probabilities, and top scorelines. The value-betting helpers are primarily used to compare model probabilities against odds when they are provided.
-
-## Outstanding items
-
-- Server must be started before live-stats and other endpoints can be verified via HTTP. In this workspace, background server may need to be restarted before a batch of curl checks.
-- Odds ingestion: the value-betting path is wired conceptually, but a real odds feed or manual odds input needs a concrete endpoint or data path before the system can recommend stakes end-to-end.
-- Backtesting/journaling for bankroll growth, calibration, and drawdown is not yet implemented.
-
-## Important notes for agent sessions
+## Notes for future agent sessions
 
 - Prefer targeted edits over rewriting whole files.
-- Before claiming the API works, start the server and hit real endpoints; build success alone is not enough.
-- If you add runtime-only dependencies or scripts, keep them local to this repo unless the user asks otherwise.
-- Do not assume shell backgrounding survives tool cleanup; when you need a long-running server, start it in a way that stays alive for the duration of the checks you need.
+- Before claiming the API works, start the server and hit real endpoints; `npm test` validates all endpoints end-to-end.
+- The backend and frontend are synchronized: predictions provide both nested properties (`outcomeProbabilities`) and flat properties (`homeWinProbability`, `drawProbability`, `awayWinProbability`, `predictedWinner`) for seamless client compatibility.
