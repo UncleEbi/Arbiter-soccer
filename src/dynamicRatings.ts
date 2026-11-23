@@ -1,5 +1,4 @@
 // Dynamic Bayesian Rating Engine with Time-Decay & Stochastic Gradient Updating
-// Implements continuous parameter learning for team attacking & defensive ratings.
 // Based on Dixon & Coles (1997) dynamic extension and Bayesian MAP (Maximum A Posteriori) estimation.
 
 import {
@@ -36,10 +35,49 @@ export interface DynamicTeamRating {
   history: RatingHistoryPoint[];
 }
 
+function createInitialRating(
+  team: string,
+  norm: string,
+  sport: SportType,
+  hAtt: number,
+  aAtt: number,
+  hDef: number,
+  aDef: number,
+  hAdv: number,
+  matches: number,
+  now: string
+): DynamicTeamRating {
+  return {
+    team,
+    normalizedName: norm,
+    sport,
+    homeAttack: hAtt,
+    awayAttack: aAtt,
+    homeDefence: hDef,
+    awayDefence: aDef,
+    homeAdvantage: hAdv,
+    matchesAnalyzed: matches,
+    lastUpdated: now,
+    formTrend: 'stable',
+    history: [
+      {
+        date: '2026-10-01T00:00:00Z',
+        opponent: 'Historical Baseline',
+        venue: 'home',
+        score: 'Baseline',
+        attackRating: hAtt,
+        defenceRating: hDef,
+        deltaAttack: 0,
+        deltaDefence: 0,
+      },
+    ],
+  };
+}
+
 export class DynamicRatingEngine {
   private ratings: Map<string, DynamicTeamRating> = new Map();
-  private learningRate: number; // eta (learning step)
-  private meanReversion: number; // gamma (shrinkage towards league average)
+  private learningRate: number;
+  private meanReversion: number;
 
   constructor(learningRate: number = 0.05, meanReversion: number = 0.01) {
     this.learningRate = learningRate;
@@ -50,87 +88,29 @@ export class DynamicRatingEngine {
   private initializeFromDefaults(): void {
     const now = new Date().toISOString();
 
+    // 1. Initialize Soccer ratings from DEFAULT_TEAM_RATINGS
     for (const [normName, base] of Object.entries(DEFAULT_TEAM_RATINGS)) {
-      const displayName = normName
-        .split(' ')
-        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-        .join(' ');
-
-      this.ratings.set(normName, {
-        team: displayName,
-        normalizedName: normName,
-        sport: 'soccer',
-        homeAttack: base.homeAttack,
-        awayAttack: base.awayAttack,
-        homeDefence: base.homeDefence,
-        awayDefence: base.awayDefence,
-        homeAdvantage: base.homeAdvantage,
-        matchesAnalyzed: base.matchesAnalyzed,
-        lastUpdated: now,
-        formTrend: 'stable',
-        history: [
-          {
-            date: '2026-10-01T00:00:00Z',
-            opponent: 'Historical Baseline',
-            venue: 'home',
-            score: 'Baseline',
-            attackRating: base.homeAttack,
-            defenceRating: base.homeDefence,
-            deltaAttack: 0,
-            deltaDefence: 0,
-          },
-        ],
-      });
+      const displayName = normName.split(' ').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+      this.ratings.set(
+        normName,
+        createInitialRating(displayName, normName, 'soccer', base.homeAttack, base.awayAttack, base.homeDefence, base.awayDefence, base.homeAdvantage, base.matchesAnalyzed, now)
+      );
     }
 
-    // NBA Teams
-    this.addTeamRating('boston celtics', 'Boston Celtics', 'basketball', 1.25, 1.20, 0.78, 0.82, 1.08, 30);
-    this.addTeamRating('los angeles lakers', 'Los Angeles Lakers', 'basketball', 1.10, 1.05, 0.95, 1.02, 1.08, 30);
-    this.addTeamRating('golden state warriors', 'Golden State Warriors', 'basketball', 1.15, 1.10, 0.90, 0.98, 1.08, 30);
-    this.addTeamRating('denver nuggets', 'Denver Nuggets', 'basketball', 1.20, 1.12, 0.85, 0.92, 1.12, 30);
+    // 2. Initialize North American Sport baselines (NBA & NHL)
+    const extraTeams: Array<[string, string, SportType, number, number, number, number, number, number]> = [
+      ['boston celtics', 'Boston Celtics', 'basketball', 1.25, 1.20, 0.78, 0.82, 1.08, 30],
+      ['los angeles lakers', 'Los Angeles Lakers', 'basketball', 1.10, 1.05, 0.95, 1.02, 1.08, 30],
+      ['golden state warriors', 'Golden State Warriors', 'basketball', 1.15, 1.10, 0.90, 0.98, 1.08, 30],
+      ['denver nuggets', 'Denver Nuggets', 'basketball', 1.20, 1.12, 0.85, 0.92, 1.12, 30],
+      ['edmonton oilers', 'Edmonton Oilers', 'hockey', 1.30, 1.15, 0.92, 1.05, 1.10, 30],
+      ['florida panthers', 'Florida Panthers', 'hockey', 1.20, 1.12, 0.80, 0.88, 1.10, 30],
+      ['new york rangers', 'New York Rangers', 'hockey', 1.18, 1.10, 0.82, 0.90, 1.10, 30],
+    ];
 
-    // NHL Teams
-    this.addTeamRating('edmonton oilers', 'Edmonton Oilers', 'hockey', 1.30, 1.15, 0.92, 1.05, 1.10, 30);
-    this.addTeamRating('florida panthers', 'Florida Panthers', 'hockey', 1.20, 1.12, 0.80, 0.88, 1.10, 30);
-    this.addTeamRating('new york rangers', 'New York Rangers', 'hockey', 1.18, 1.10, 0.82, 0.90, 1.10, 30);
-  }
-
-  private addTeamRating(
-    norm: string,
-    display: string,
-    sport: SportType,
-    hAtt: number,
-    aAtt: number,
-    hDef: number,
-    aDef: number,
-    hAdv: number,
-    matches: number
-  ) {
-    this.ratings.set(norm, {
-      team: display,
-      normalizedName: norm,
-      sport,
-      homeAttack: hAtt,
-      awayAttack: aAtt,
-      homeDefence: hDef,
-      awayDefence: aDef,
-      homeAdvantage: hAdv,
-      matchesAnalyzed: matches,
-      lastUpdated: new Date().toISOString(),
-      formTrend: 'stable',
-      history: [
-        {
-          date: '2026-10-01T00:00:00Z',
-          opponent: 'Historical Baseline',
-          venue: 'home',
-          score: 'Baseline',
-          attackRating: hAtt,
-          defenceRating: hDef,
-          deltaAttack: 0,
-          deltaDefence: 0,
-        },
-      ],
-    });
+    for (const [norm, disp, sport, hAtt, aAtt, hDef, aDef, hAdv, matches] of extraTeams) {
+      this.ratings.set(norm, createInitialRating(disp, norm, sport, hAtt, aAtt, hDef, aDef, hAdv, matches, now));
+    }
   }
 
   public getTeam(name: string): DynamicTeamRating {
@@ -138,28 +118,14 @@ export class DynamicRatingEngine {
     const existing = this.ratings.get(norm);
     if (existing) return existing;
 
-    // Create dynamically for unknown teams
-    const newRating: DynamicTeamRating = {
-      team: name,
-      normalizedName: norm,
-      sport: 'soccer',
-      homeAttack: BASELINE_RATING.homeAttack,
-      awayAttack: BASELINE_RATING.awayAttack,
-      homeDefence: BASELINE_RATING.homeDefence,
-      awayDefence: BASELINE_RATING.awayDefence,
-      homeAdvantage: BASELINE_RATING.homeAdvantage,
-      matchesAnalyzed: 0,
-      lastUpdated: new Date().toISOString(),
-      formTrend: 'stable',
-      history: [],
-    };
+    const newRating = createInitialRating(name, norm, 'soccer', BASELINE_RATING.homeAttack, BASELINE_RATING.awayAttack, BASELINE_RATING.homeDefence, BASELINE_RATING.awayDefence, BASELINE_RATING.homeAdvantage, 0, new Date().toISOString());
     this.ratings.set(norm, newRating);
     return newRating;
   }
 
   public getAllTeams(sport?: SportType): DynamicTeamRating[] {
     const all = Array.from(this.ratings.values());
-    if (sport && sport !== ('all' as any)) {
+    if (sport && (sport as any) !== 'all') {
       return all.filter((t) => t.sport === sport);
     }
     return all;
@@ -175,38 +141,25 @@ export class DynamicRatingEngine {
     awayScore: number,
     matchDate: string = new Date().toISOString(),
     sport: SportType = 'soccer'
-  ): {
-    homeUpdates: { deltaAttack: number; deltaDefence: number; newAttack: number; newDefence: number };
-    awayUpdates: { deltaAttack: number; deltaDefence: number; newAttack: number; newDefence: number };
-  } {
+  ) {
     const homeTeam = this.getTeam(homeTeamName);
     const awayTeam = this.getTeam(awayTeamName);
 
-    // Expected intensity
     const baselineHome = sport === 'basketball' ? 112 : sport === 'hockey' ? 3.0 : 1.45;
     const baselineAway = sport === 'basketball' ? 108 : sport === 'hockey' ? 2.7 : 1.15;
 
     const expectedHome = homeTeam.homeAttack * awayTeam.awayDefence * homeTeam.homeAdvantage * baselineHome;
     const expectedAway = awayTeam.awayAttack * homeTeam.homeDefence * baselineAway;
 
-    // Relative scoring error
-    const errHome = (homeScore - expectedHome) / Math.max(0.5, expectedHome);
-    const errAway = (awayScore - expectedAway) / Math.max(0.5, expectedAway);
+    // Relative scoring error clamped to prevent extreme single-game skew
+    const errHome = Math.max(-1.5, Math.min(1.5, (homeScore - expectedHome) / Math.max(0.5, expectedHome)));
+    const errAway = Math.max(-1.5, Math.min(1.5, (awayScore - expectedAway) / Math.max(0.5, expectedAway)));
 
-    // Clamp gradients to avoid excessive volatility from extreme single matches (e.g. 7-0)
-    const clampedErrHome = Math.max(-1.5, Math.min(1.5, errHome));
-    const clampedErrAway = Math.max(-1.5, Math.min(1.5, errAway));
+    const deltaHomeAttack = parseFloat((this.learningRate * errHome - this.meanReversion * (homeTeam.homeAttack - 1.0)).toFixed(4));
+    const deltaAwayDefence = parseFloat((this.learningRate * errHome - this.meanReversion * (awayTeam.awayDefence - 1.0)).toFixed(4));
+    const deltaAwayAttack = parseFloat((this.learningRate * errAway - this.meanReversion * (awayTeam.awayAttack - 1.0)).toFixed(4));
+    const deltaHomeDefence = parseFloat((this.learningRate * errAway - this.meanReversion * (homeTeam.homeDefence - 1.0)).toFixed(4));
 
-    // Gradient updates:
-    // When home scores MORE than expected: home attack goes UP, away defence (conceding rate) goes UP (worse)
-    // When away scores LESS than expected: away attack goes DOWN, home defence (conceding rate) goes DOWN (better)
-    const deltaHomeAttack = parseFloat((this.learningRate * clampedErrHome - this.meanReversion * (homeTeam.homeAttack - 1.0)).toFixed(4));
-    const deltaAwayDefence = parseFloat((this.learningRate * clampedErrHome - this.meanReversion * (awayTeam.awayDefence - 1.0)).toFixed(4));
-
-    const deltaAwayAttack = parseFloat((this.learningRate * clampedErrAway - this.meanReversion * (awayTeam.awayAttack - 1.0)).toFixed(4));
-    const deltaHomeDefence = parseFloat((this.learningRate * clampedErrAway - this.meanReversion * (homeTeam.homeDefence - 1.0)).toFixed(4));
-
-    // Apply updates within reasonable bounds [0.45, 2.20]
     homeTeam.homeAttack = Math.max(0.45, Math.min(2.20, parseFloat((homeTeam.homeAttack + deltaHomeAttack).toFixed(3))));
     homeTeam.homeDefence = Math.max(0.45, Math.min(2.20, parseFloat((homeTeam.homeDefence + deltaHomeDefence).toFixed(3))));
     homeTeam.matchesAnalyzed += 1;
@@ -217,48 +170,24 @@ export class DynamicRatingEngine {
     awayTeam.matchesAnalyzed += 1;
     awayTeam.lastUpdated = matchDate;
 
-    // Record histories
     homeTeam.history.push({
-      date: matchDate,
-      opponent: awayTeam.team,
-      venue: 'home',
-      score: `${homeScore}-${awayScore}`,
-      attackRating: homeTeam.homeAttack,
-      defenceRating: homeTeam.homeDefence,
-      deltaAttack: deltaHomeAttack,
-      deltaDefence: deltaHomeDefence,
+      date: matchDate, opponent: awayTeam.team, venue: 'home', score: `${homeScore}-${awayScore}`,
+      attackRating: homeTeam.homeAttack, defenceRating: homeTeam.homeDefence, deltaAttack: deltaHomeAttack, deltaDefence: deltaHomeDefence,
     });
     if (homeTeam.history.length > 25) homeTeam.history.shift();
 
     awayTeam.history.push({
-      date: matchDate,
-      opponent: homeTeam.team,
-      venue: 'away',
-      score: `${homeScore}-${awayScore}`,
-      attackRating: awayTeam.awayAttack,
-      defenceRating: awayTeam.awayDefence,
-      deltaAttack: deltaAwayAttack,
-      deltaDefence: deltaAwayDefence,
+      date: matchDate, opponent: homeTeam.team, venue: 'away', score: `${homeScore}-${awayScore}`,
+      attackRating: awayTeam.awayAttack, defenceRating: awayTeam.awayDefence, deltaAttack: deltaAwayAttack, deltaDefence: deltaAwayDefence,
     });
     if (awayTeam.history.length > 25) awayTeam.history.shift();
 
-    // Determine form trends based on last 3 adjustments
     homeTeam.formTrend = this.calculateFormTrend(homeTeam.history);
     awayTeam.formTrend = this.calculateFormTrend(awayTeam.history);
 
     return {
-      homeUpdates: {
-        deltaAttack: deltaHomeAttack,
-        deltaDefence: deltaHomeDefence,
-        newAttack: homeTeam.homeAttack,
-        newDefence: homeTeam.homeDefence,
-      },
-      awayUpdates: {
-        deltaAttack: deltaAwayAttack,
-        deltaDefence: deltaAwayDefence,
-        newAttack: awayTeam.awayAttack,
-        newDefence: awayTeam.awayDefence,
-      },
+      homeUpdates: { deltaAttack: deltaHomeAttack, deltaDefence: deltaHomeDefence, newAttack: homeTeam.homeAttack, newDefence: homeTeam.homeDefence },
+      awayUpdates: { deltaAttack: deltaAwayAttack, deltaDefence: deltaAwayDefence, newAttack: awayTeam.awayAttack, newDefence: awayTeam.awayDefence },
     };
   }
 
@@ -287,5 +216,4 @@ export class DynamicRatingEngine {
   }
 }
 
-// Global dynamic ratings instance
 export const dynamicRatingEngine = new DynamicRatingEngine();

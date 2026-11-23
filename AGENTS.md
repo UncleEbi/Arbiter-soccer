@@ -14,6 +14,7 @@ Sports prediction app focused on consistent profitability through value identifi
   - Basketball (NBA): Possession pace and offensive/defensive rating differential evaluated via normal CDF for Spreads and Totals.
   - Ice Hockey (NHL): 60-min regulation Poisson coupled with overtime tiebreaker progression + Puck line (+/- 1.5) + Totals.
   - Tennis (ATP): Barnett-Clarke hierarchical Markov chain hold/break model for match winner, set betting (2-0, 2-1), and game totals.
+- `src/fixtures.ts`: Local-first shelf benchmark fixture repository & TypeScript type declarations (`MatchData`, `TeamLineupInfo`, `MatchStatsInfo`).
 - `src/liveIngestion.ts`: Live External Feeds & Ingestion Pipeline:
   - Connectors for Football-Data.org, API-Football / RapidAPI, TheSportsDB, and Simulated In-Play Stream Generator.
   - Endpoints: `GET /api/feed/status`, `POST /api/feed/sync`, `POST /api/feed/config`.

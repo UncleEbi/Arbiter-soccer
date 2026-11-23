@@ -193,6 +193,36 @@ function getApiBase(): string {
   return 'http://localhost:5000';
 }
 
+async function apiGet<T = any>(endpoint: string): Promise<T> {
+  const base = getApiBase();
+  try {
+    const res = await axios.get(`${base}${endpoint}`, { timeout: 8000 });
+    return res.data;
+  } catch (err: any) {
+    if (base.includes('localhost')) {
+      const fallback = base.replace('localhost', '127.0.0.1');
+      const res = await axios.get(`${fallback}${endpoint}`, { timeout: 8000 });
+      return res.data;
+    }
+    throw err;
+  }
+}
+
+async function apiPost<T = any>(endpoint: string, body?: any): Promise<T> {
+  const base = getApiBase();
+  try {
+    const res = await axios.post(`${base}${endpoint}`, body, { timeout: 8000 });
+    return res.data;
+  } catch (err: any) {
+    if (base.includes('localhost')) {
+      const fallback = base.replace('localhost', '127.0.0.1');
+      const res = await axios.post(`${fallback}${endpoint}`, body, { timeout: 8000 });
+      return res.data;
+    }
+    throw err;
+  }
+}
+
 function formatDate(isoString: string): string {
   try {
     const d = new Date(isoString);
@@ -283,25 +313,9 @@ function App() {
     try {
       setLoading(true);
       setError(null);
-      const apiBase = getApiBase();
-      let res;
-      const url = `${apiBase}/matches/predictions?sport=${selectedSport}&country=${selectedCountry}`;
-      try {
-        res = await axios.get(url, { timeout: 8000 });
-      } catch (firstErr: any) {
-        const fallbackBase = apiBase.includes('localhost')
-          ? apiBase.replace('localhost', '127.0.0.1')
-          : apiBase.includes('127.0.0.1')
-          ? apiBase.replace('127.0.0.1', 'localhost')
-          : '';
-        if (fallbackBase) {
-          res = await axios.get(`${fallbackBase}/matches/predictions?sport=${selectedSport}&country=${selectedCountry}`, { timeout: 8000 });
-        } else {
-          throw firstErr;
-        }
-      }
+      const res = await apiGet(`/matches/predictions?sport=${selectedSport}&country=${selectedCountry}`);
 
-      const list = res.data.predictions.map((p: any) => ({
+      const list = res.predictions.map((p: any) => ({
         fixtureId: p.fixtureId,
         sport: p.sport || 'soccer',
         country: p.country || 'International',
@@ -317,7 +331,7 @@ function App() {
       setMatches(list);
 
       const preds: Record<number, PredictionData> = {};
-      res.data.predictions.forEach((p: any) => {
+      res.predictions.forEach((p: any) => {
         preds[p.fixtureId] = p.prediction;
       });
       setPredictions(preds);
@@ -337,8 +351,8 @@ function App() {
 
   const fetchFeedStatus = async () => {
     try {
-      const res = await axios.get(`${getApiBase()}/api/feed/status`);
-      setFeedStatus(res.data);
+      const data = await apiGet('/api/feed/status');
+      setFeedStatus(data);
     } catch (err: any) {
       console.error('Error fetching feed status:', err);
     }
@@ -348,8 +362,8 @@ function App() {
     try {
       setSyncing(true);
       setSyncMessage(null);
-      const res = await axios.post(`${getApiBase()}/api/feed/sync`, { provider });
-      setSyncMessage(res.data.result?.message || 'Sync successful');
+      const res = await apiPost('/api/feed/sync', { provider });
+      setSyncMessage(res.result?.message || 'Sync successful');
       await fetchFeedStatus();
       await fetchMatchesAndPredictions();
     } catch (err: any) {
@@ -361,7 +375,7 @@ function App() {
 
   const saveFeedKeys = async () => {
     try {
-      await axios.post(`${getApiBase()}/api/feed/config`, {
+      await apiPost('/api/feed/config', {
         footballDataApiKey: footballDataKey || undefined,
         apiFootballApiKey: apiFootballKey || undefined,
       });
@@ -374,8 +388,8 @@ function App() {
 
   const fetchRatings = async () => {
     try {
-      const res = await axios.get(`${getApiBase()}/ratings/teams?sport=${ratingsSportFilter}`);
-      setRatingsList(res.data.ratings || []);
+      const data = await apiGet(`/ratings/teams?sport=${ratingsSportFilter}`);
+      setRatingsList(data.ratings || []);
     } catch (err: any) {
       console.error('Error fetching ratings:', err);
     }
@@ -383,8 +397,8 @@ function App() {
 
   const fetchCalibration = async () => {
     try {
-      const res = await axios.get(`${getApiBase()}/calibration/metrics?sport=${calibrationSportFilter}`);
-      setCalibrationData(res.data);
+      const data = await apiGet(`/calibration/metrics?sport=${calibrationSportFilter}`);
+      setCalibrationData(data);
     } catch (err: any) {
       console.error('Error fetching calibration:', err);
     }
@@ -392,8 +406,8 @@ function App() {
 
   const fetchDailyDigest = async () => {
     try {
-      const res = await axios.get(`${getApiBase()}/digest/daily`);
-      setDigestData(res.data);
+      const data = await apiGet('/digest/daily');
+      setDigestData(data);
     } catch (err: any) {
       console.error('Error fetching daily digest:', err);
     }
@@ -403,11 +417,11 @@ function App() {
     if (!webhookUrl) return;
     try {
       setWebhookStatus('Dispatching webhook brief...');
-      const res = await axios.post(`${getApiBase()}/export/webhook`, { webhookUrl });
-      if (res.data.success) {
+      const res = await apiPost('/export/webhook', { webhookUrl });
+      if (res.success) {
         setWebhookStatus('✅ Successfully dispatched daily briefing to webhook!');
       } else {
-        setWebhookStatus(`❌ Webhook error: ${res.data.error || 'Failed'}`);
+        setWebhookStatus(`❌ Webhook error: ${res.error || 'Failed'}`);
       }
     } catch (err: any) {
       setWebhookStatus(`❌ Webhook failed: ${err.message}`);
